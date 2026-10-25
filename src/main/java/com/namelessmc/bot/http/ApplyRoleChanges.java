@@ -1,0 +1,169 @@
+package com.namelessmc.bot.http;
+
+import java.util.List;
+
+import org.glassfish.grizzly.http.Method;
+import org.glassfish.grizzly.http.server.HttpHandler;
+import org.glassfish.grizzly.http.server.Request;
+import org.glassfish.grizzly.http.server.Response;
+import org.glassfish.grizzly.http.util.HttpStatus;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.google.common.base.Ascii;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import com.google.gson.JsonSyntaxException;
+import com.namelessmc.bot.Main;
+import com.namelessmc.bot.connections.BackendStorageException;
+import com.namelessmc.bot.util.Util;
+import com.namelessmc.java_api.NamelessAPI;
+
+import net.dv8tion.jda.api.entities.Guild;
+import net.dv8tion.jda.api.entities.Member;
+import net.dv8tion.jda.api.entities.Role;
+import net.dv8tion.jda.api.exceptions.HierarchyException;
+import net.dv8tion.jda.api.exceptions.InsufficientPermissionException;
+
+public class ApplyRoleChanges extends HttpHandler {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(ApplyRoleChanges.class);
+
+    @Override
+    public void service(Request request, Response response) throws Exception {
+        if (request.getMethod() != Method.POST) {
+            response.setStatus(HttpStatus.METHOD_NOT_ALLOWED_405);
+            return;
+        }
+
+        final JsonObject responseJson = new JsonObject();
+
+        final JsonObject json;
+        final long guildId;
+        final String apiKey;
+        final JsonArray roles;
+        try {
+            json = (JsonObject) JsonParser.parseReader(request.getReader());
+            guildId = Long.parseLong(json.get("guild_id").getAsString());
+            apiKey = json.get("api_key").getAsString();
+            roles = json.getAsJsonArray("role_changes");
+        } catch (JsonSyntaxException | IllegalArgumentException | ClassCastException e) {
+            responseJson.addProperty("status", "bad_request");
+            responseJson.addProperty("meta", e.getClass().getSimpleName());
+            response.setStatus(HttpStatus.BAD_REQUEST_400);
+            Util.sendJsonResponse(responseJson, response);
+            LOGGER.warn("Received bad role change request from website: invalid json syntax or missing/invalid guild_id, user_id or api_key");
+            return;
+        }
+
+        if (apiKey == null || roles == null) {
+            responseJson.addProperty("status", "bad_request");
+            responseJson.addProperty("meta", "null api key or null roles");
+            response.setStatus(HttpStatus.BAD_REQUEST_400);
+            Util.sendJsonResponse(responseJson, response);
+            LOGGER.warn("Received bad role change request from website: zero guild id, null api key, or null roles");
+            return;
+        }
+
+        final NamelessAPI api;
+        try {
+            api = Main.getConnectionManager().getApiConnection(guildId);
+        } catch (final BackendStorageException e) {
+            response.getWriter().write("error");
+            e.printStackTrace();
+            return;
+        }
+
+        if (api == null) {
+            responseJson.addProperty("status", "not_linked");
+            response.setStatus(HttpStatus.BAD_REQUEST_400);
+            Util.sendJsonResponse(responseJson, response);
+            LOGGER.warn("Received bad role change request from website: website is not linked");
+            return;
+        }
+
+        if (!Util.timingSafeEquals(apiKey.getBytes(), api.apiKey().getBytes())) {
+            responseJson.addProperty("status", "unauthorized");
+            responseJson.addProperty("meta", "Invalid API key");
+            response.setStatus(HttpStatus.UNAUTHORIZED_401);
+            Util.sendJsonResponse(responseJson, response);
+            LOGGER.warn("Received bad role change request from website: invalid API key. provided='{}' expected='{}'",
+                    Ascii.truncate(apiKey, 100, "..."),
+                    Ascii.truncate(api.apiKey(), 100, "..."));
+            return;
+        }
+
+        final Guild guild = Main.getJdaForGuild(guildId).getGuildById(guildId);
+        if (guild == null) {
+            responseJson.addProperty("status", "invalid_guild");
+            response.setStatus(HttpStatus.BAD_REQUEST_400);
+            Util.sendJsonResponse(responseJson, response);
+            LOGGER.warn("Received bad role change request from website: invalid guild id, guild id = '{}'", guildId);
+            return;
+        }
+
+        final JsonArray roleResponses = new JsonArray(roles.size());
+
+        for (final JsonElement roleElem : roles) {
+            final JsonObject roleObj = roleElem.getAsJsonObject();
+
+            final long userId = Long.parseLong(roleObj.get("user_id").getAsString());
+            final long roleId = Long.parseLong(roleObj.get("role_id").getAsString());
+            final String action = roleObj.get("action").getAsString();
+
+            final Member member = guild.getMemberById(userId);
+            final Role role = guild.getRoleById(roleId);
+
+            String status;
+            if (member == null) {
+                status = "invalid_user";
+            } else if (role == null) {
+                status = "invalid_role";
+            } else {
+                final List<Role> currentRoles = member.getRoles();
+                try {
+                    if (action.equals("add")) {
+                        if (currentRoles.contains(role)) {
+                            status = "none";
+                            LOGGER.info("Member '{}' already has role '{}'", member.getUser().getName(), role.getName());
+                        } else {
+                            LOGGER.info("Adding role '{}' to member '{}'", role.getName(), member.getUser().getName());
+                            status = "added";
+                            guild.addRoleToMember(member, role).complete();
+                        }
+                    } else if (action.equals("remove")) {
+                        if (!currentRoles.contains(role)) {
+                            status = "none";
+                            LOGGER.info("Member '{}' already doesn't have role '{}'", member.getUser().getName(), role.getName());
+                        } else {
+                            LOGGER.info("Removing role '{}' from member '{}'", role.getName(), member.getUser().getName());
+                            status = "removed";
+                            guild.removeRoleFromMember(member, role).complete();
+                        }
+                    } else {
+                        response.setStatus(HttpStatus.BAD_REQUEST_400);
+                        responseJson.addProperty("status", "bad_request");
+                        responseJson.addProperty("meta", "invalid role change action: " + action);
+                        Util.sendJsonResponse(responseJson, response);
+                        return;
+                    }
+                } catch (final HierarchyException | InsufficientPermissionException e2) {
+                    LOGGER.warn("Cannot process role change: {}", e2.getClass().getSimpleName());
+                    status = "no_permission";
+                }
+            }
+
+            final JsonObject roleResponse = new JsonObject();
+            roleResponse.addProperty("status", status);
+            roleResponse.addProperty("user_id", String.valueOf(userId));
+            roleResponse.addProperty("role_id", String.valueOf(roleId));
+            roleResponses.add(roleResponse);
+        }
+
+        responseJson.addProperty("status", "success");
+        responseJson.add("role_changes", roleResponses);
+        Util.sendJsonResponse(responseJson, response);
+    }
+}
