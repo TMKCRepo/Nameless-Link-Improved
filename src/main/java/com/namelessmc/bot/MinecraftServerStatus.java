@@ -190,7 +190,7 @@ public class MinecraftServerStatus {
 		if (countId != null && !countId.isBlank()) {
 			String txt;
 			if (!st.online) {
-				txt = (offlineText == null || offlineText.isBlank()) ? "🔴 Offline" : offlineText;
+				txt = "0/0";
 			} else if (countText == null || countText.isBlank()) {
 				txt = st.players + "/" + st.max;
 			} else if (countText.contains("{players}") || countText.contains("{max}")) {
